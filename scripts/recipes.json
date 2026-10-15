@@ -1,0 +1,39 @@
+{
+  "reddit-mcp-buddy": {
+    "http": true,
+    "how": "Set REDDIT_BUDDY_HTTP=true and REDDIT_BUDDY_PORT=<port>. Endpoint http://127.0.0.1:<port>/mcp.",
+    "auth": "Reads public Reddit only. Rejects a forged Host header with 403.",
+    "source": "https://github.com/karanb192/reddit-mcp-buddy"
+  },
+  "slack-mcp-server": {
+    "http": true,
+    "how": "Run with --transport http and SLACK_MCP_HOST=127.0.0.1, SLACK_MCP_PORT=<port>. Endpoint /mcp.",
+    "auth": "Set SLACK_MCP_API_KEY and have each agent send it as a Bearer header. The key guards tool calls only: tools/list answers without it, and with no key set every call is accepted.",
+    "source": "https://github.com/korotovsky/slack-mcp-server"
+  },
+  "mcp-atlassian": {
+    "http": true,
+    "how": "Run with --transport streamable-http --host 127.0.0.1 --port <port> --path /mcp.",
+    "auth": "Over HTTP it ignores its own stored token and answers 401 unless a request carries credentials. Have each agent send Authorization: Basic base64(email:token). Do not set ALLOW_GLOBAL_CRED_FALLBACK, which lets any local caller act as you.",
+    "source": "https://github.com/sooperset/mcp-atlassian"
+  },
+  "awslabs.aws-pricing-mcp-server": {
+    "http": false,
+    "aliases": ["aws-pricing-mcp-server"],
+    "how": "Starts with mcp.run() and no transport option, so it speaks stdio only.",
+    "source": "https://github.com/awslabs/mcp/tree/main/src/aws-pricing-mcp-server"
+  },
+  "@upstash/context7-mcp": {
+    "hosted": "https://mcp.context7.com/mcp",
+    "aliases": ["context7"],
+    "how": "Point every agent at the hosted URL and drop the local copy. An API key is optional, for higher rate limits.",
+    "source": "https://github.com/upstash/context7"
+  },
+  "@playwright/mcp": {
+    "http": true,
+    "stateful": true,
+    "how": "--port <port> serves HTTP.",
+    "auth": "One shared server means one shared browser, so tabs and logins mix across sessions. Keep it per session unless that is what you want.",
+    "source": "https://github.com/microsoft/playwright-mcp"
+  }
+}

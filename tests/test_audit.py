@@ -1,0 +1,173 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import audit  # noqa: E402
+
+SECRET = "xoxp-not-a-real-token-123"
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+class Machine:
+    """A made-up home directory and process table: two Claude sessions, one Codex, one Grok."""
+
+    def __init__(self, root):
+        h = self.home = Path(root)
+        plugin = h / ".claude/plugins/cache/market/finder/1.0.0"
+        write(plugin / ".mcp.json", json.dumps({"mcpServers": {"mods": {
+            "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/server.mjs"]}}}))
+        write(h / ".claude/plugins/installed_plugins.json", json.dumps({"plugins": {
+            "finder@market": [{"installPath": str(plugin)}]}}))
+        write(h / ".claude/settings.json", json.dumps({"enabledPlugins": {"finder@market": True}}))
+        write(h / ".claude.json", json.dumps({"mcpServers": {
+            "slack": {"command": "npx", "args": ["-y", "slack-mcp-server@1.3.0"],
+                      "env": {"SLACK_MCP_XOXP_TOKEN": SECRET}},
+            "atlassian": {"command": "uvx", "args": ["mcp-atlassian@0.23.1"],
+                          "env": {"JIRA_API_TOKEN": SECRET}},
+            "reddit": {"command": "npx", "args": ["-y", "reddit-mcp-buddy@1.1.14"]},
+            "reddit-dev": {"command": "node", "args": [str(h / "src/reddit-mcp-buddy/dist/index.js")]},
+            "context7": {"command": "npx", "args": ["-y", "@upstash/context7-mcp@latest"]},
+            "mystery": {"command": "npx", "args": ["-y", "mystery-mcp@2.0.0"]},
+            "idle": {"command": "npx", "args": ["-y", "idle-mcp@1.0.0"]},
+            "remote": {"type": "http", "url": "https://mcp.example.com/mcp"},
+        }}))
+        write(h / ".codex/config.toml", '[mcp_servers.slack]\ncommand = "npx"\n'
+              'args = ["-y", "slack-mcp-server@1.3.0"]\nenv = { SLACK_MCP_XOXP_TOKEN = "' + SECRET + '" }\n')
+        write(h / ".grok/config.toml", "")
+        write(h / ".claude/projects/-work/s1.jsonl", '{"name":"mcp__slack__channels_list"}\n{"name":"mcp__mystery__go"}\n'
+              '{"name":"mcp__context7__docs"}\n{"name":"mcp__reddit__search"}\n')
+        write(h / ".claude/projects/-work/s2.jsonl", '{"name":"mcp__plugin_finder_mods__search"}\n')
+        write(h / ".codex/sessions/2026/10/15/r1.jsonl", '{"server":"slack"}\n')
+        write(h / ".grok/sessions/x/one/updates.jsonl", '{"server_name":"atlassian"}\n')
+
+        rows = [(1, 0, 10, "/sbin/launchd")]
+        pid = 100
+
+        def proc(ppid, rss, cmd):
+            nonlocal pid
+            pid += 1
+            rows.append((pid, ppid, rss, cmd))
+            return pid
+
+        def stdio(session, launcher, server):
+            lp = proc(session, 30000, launcher)
+            proc(lp, 50000, server)
+
+        for _ in range(2):
+            c = proc(1, 400000, "claude")
+            stdio(c, "npm exec slack-mcp-server@1.3.0", "node /cache/_npx/a/node_modules/.bin/slack-mcp-server")
+            stdio(c, "uv tool uvx mcp-atlassian@0.23.1", "/cache/uv/env/bin/python /cache/uv/env/bin/mcp-atlassian")
+            stdio(c, "npm exec reddit-mcp-buddy@1.1.14", "node /cache/_npx/b/node_modules/.bin/reddit-mcp-buddy")
+            proc(c, 40000, f"node {h}/src/reddit-mcp-buddy/dist/index.js")
+            stdio(c, "npm exec @upstash/context7-mcp@latest", "node /cache/_npx/c/node_modules/.bin/context7-mcp")
+            stdio(c, "npm exec mystery-mcp@2.0.0", "node /cache/_npx/d/node_modules/.bin/mystery-mcp")
+            stdio(c, "npm exec idle-mcp@1.0.0", "node /cache/_npx/e/node_modules/.bin/idle-mcp")
+            proc(c, 60000, f"node {plugin}/server.mjs")
+            proc(c, 3000, "/bin/zsh -c grep mcp ~/notes.txt")
+        x = proc(1, 300000, "/opt/homebrew/bin/codex")
+        stdio(x, "npm exec slack-mcp-server@1.3.0", "node /cache/_npx/a/node_modules/.bin/slack-mcp-server")
+        g = proc(1, 200000, "/home/me/.grok/bin/grok")
+        stdio(g, "npm exec slack-mcp-server@1.3.0", "node /cache/_npx/a/node_modules/.bin/slack-mcp-server")
+        self.ps = "\n".join(f"{a} {b} {c} {d}" for a, b, c, d in rows)
+
+    def report(self, **kw):
+        kw.setdefault("use_cli", False)
+        return audit.audit(self.home, self.ps, **kw)
+
+
+class AuditTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.m = Machine(self.tmp.name)
+        self.r = self.m.report()
+        self.rows = {r["server"]: r for r in self.r["servers"]}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_counts_sessions_per_agent(self):
+        self.assertEqual(self.r["sessions"], {"claude": 2, "codex": 1, "grok": 1})
+
+    def test_shared_server_counts_every_agents_copies_and_launchers(self):
+        slack = self.rows["slack"]
+        self.assertEqual(slack["action"], "share")
+        self.assertEqual(slack["copies"], 4)
+        self.assertEqual(slack["processes"], 8)
+        self.assertEqual(slack["agents"], ["claude", "codex", "grok"])
+        self.assertTrue(any("4 idle npx/uvx launcher" in f for f in slack["flags"]))
+        self.assertGreater(slack["saving_mb"], 0)
+
+    def test_credential_servers_get_the_refusal_warning(self):
+        for name in ("slack", "atlassian"):
+            self.assertTrue(any("holds a credential" in f for f in self.rows[name]["flags"]), name)
+        self.assertNotIn("credential", " ".join(self.rows["reddit"]["flags"]))
+
+    def test_hosted_alternative_and_unpinned_version(self):
+        c7 = self.rows["context7"]
+        self.assertEqual(c7["action"], "use-hosted")
+        self.assertIn("version not pinned", c7["flags"])
+        self.assertEqual(c7["saving_mb"], c7["rss_mb"])
+
+    def test_unknown_server_is_checked_when_used_and_flagged_when_idle(self):
+        self.assertEqual(self.rows["mystery"]["action"], "check")
+        self.assertEqual(self.rows["mystery"]["copies"], 2)
+        self.assertEqual(self.rows["idle"]["action"], "remove?")
+
+    def test_plugin_server_is_reported_but_not_counted_as_actionable(self):
+        plug = self.rows["finder:mods"]
+        self.assertEqual(plug["action"], "plugin")
+        self.assertEqual(plug["copies"], 2)
+        self.assertEqual(plug["used_sessions"]["claude"], 1)
+        total = sum(r["saving_mb"] for r in self.r["servers"] if r["action"] != "plugin")
+        self.assertEqual(self.r["totals"]["saving_mb"], total)
+
+    def test_same_server_under_two_names_is_a_duplicate(self):
+        self.assertEqual(self.r["duplicates"], [
+            {"agents": ["claude", "grok"], "stem": "reddit-mcp-buddy", "names": ["reddit", "reddit-dev"]}])
+        self.assertTrue(any("possible duplicate of reddit-dev" in f for f in self.rows["reddit"]["flags"]))
+        self.assertEqual(self.rows["reddit-dev"]["action"], "remove?")
+
+    def test_shell_commands_that_mention_mcp_are_ignored(self):
+        self.assertFalse([r for r in self.r["servers"] if r["identity"].startswith("unconfigured")])
+
+    def test_usage_comes_from_each_agents_logs(self):
+        self.assertEqual(self.rows["slack"]["used_sessions"], {"claude": 1, "codex": 1, "grok": 0})
+        self.assertEqual(self.rows["atlassian"]["used_sessions"]["grok"], 1)
+        self.assertIsNone(self.m.report(usage=False)["servers"][0]["used_sessions"])
+
+    def test_remote_server_needs_nothing(self):
+        self.assertEqual(self.rows["remote"]["action"], "ok")
+        self.assertEqual(self.rows["remote"]["copies"], 0)
+
+    def test_output_never_contains_secret_values_or_the_home_path(self):
+        md = audit.markdown(self.r, self.m.home)
+        js = json.dumps(self.r)
+        self.assertNotIn(SECRET, md + js)
+        self.assertNotIn(str(self.m.home), md)
+        self.assertIn("SLACK_MCP_XOXP_TOKEN", self.rows["slack"]["credential_names"])
+
+
+class HelperTest(unittest.TestCase):
+    def test_package_names_and_versions(self):
+        self.assertEqual(audit.pkg_name("@scope/name@1.2.3"), "@scope/name")
+        self.assertEqual(audit.pkg_name("mcp-atlassian==0.23.1"), "mcp-atlassian")
+        self.assertEqual(audit.pkg_version("@scope/name@1.2.3"), "1.2.3")
+        self.assertIsNone(audit.pkg_version("@scope/name"))
+        self.assertEqual(audit.pkg_version("tool@latest"), "latest")
+
+    def test_launcher_detection(self):
+        self.assertTrue(audit.is_launcher("npm exec foo@1"))
+        self.assertTrue(audit.is_launcher("node /opt/homebrew/bin/npx -y foo"))
+        self.assertTrue(audit.is_launcher("uv tool uvx foo"))
+        self.assertFalse(audit.is_launcher("node /x/server.js"))
+
+
+if __name__ == "__main__":
+    unittest.main()
