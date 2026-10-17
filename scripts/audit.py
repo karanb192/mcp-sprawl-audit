@@ -28,8 +28,10 @@ AGENTS = ("claude", "codex", "grok")
 LAUNCHERS = {"npx", "npm", "uvx", "uv", "pnpm", "bunx", "pipx", "yarn"}
 NODE_LAUNCHERS = {"npx", "npm", "pnpm", "bunx", "yarn"}
 LAUNCHER_SUBCOMMANDS = {"exec", "dlx", "run", "tool", "x", "--"}
-OPTS_WITH_VALUE = {"-p", "--package", "--python", "--from", "--with", "--with-requirements", "--index",
-                   "--index-url", "--default-index", "--extra-index-url", "--registry", "--spec", "--cache-dir"}
+OPTS_WITH_VALUE = {"-p", "--package", "--python", "--from", "--with", "--with-requirements", "--with-editable",
+                   "--index", "--index-url", "--default-index", "--extra-index-url", "--registry", "--spec",
+                   "--cache-dir", "--cache", "--directory", "--project", "--env-file", "--constraints",
+                   "--overrides", "--userconfig", "--workspace", "-w", "--prefix", "--python-preference"}
 SECRET_RE = re.compile(r"TOKEN|KEY|SECRET|PASS|AUTH|COOKIE|CREDENTIAL", re.I)
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 VAR_RE = re.compile(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
@@ -257,36 +259,49 @@ def env_off(name):
 
 
 def grok_entries(home, claude, cwds):
+    """Grok's effective servers for each running directory: project config, then user config,
+    then the Claude and Cursor config it imports. Contexts never hide each other's servers."""
     cfg, servers = toml_servers(home / ".grok/config.toml")
-    dirs = sorted({d for cwd in cwds for d in project_dirs(cwd, home)} - {home}, key=lambda d: -len(d.parts))
-    layers = [("project:" + str(d), str(d / ".grok/config.toml"), toml_servers(d / ".grok/config.toml")[1])
-              for d in dirs] + [("user", "~/.grok/config.toml", servers)]
-    blocked = set(cfg.get("disabled_mcp_servers") or [])
-    out, seen = [], set()
-    for scope, source, layer in layers:
-        for name, s in layer.items():
-            if name in seen or name in blocked:
-                continue
-            seen.add(name)  # a disabled native entry still hides the same name from compat sources
-            if s.get("enabled", True):
-                out.append(make_entry("grok", name, scope, source, s))
     compat = cfg.get("compat") or {}
-    roots = {str(d) for d in dirs}
-    if not env_off("GROK_CLAUDE_MCPS_ENABLED") and (compat.get("claude") or {}).get("mcps", True):
-        for e in claude:
-            if e["plugin"] or e["scope"] == "managed" or e["name"] in seen or e["name"] in blocked:
-                continue
-            if e["scope"] != "user" and e["scope"].split(":", 1)[1] not in roots:
-                continue
-            out.append(dict(e, agent="grok", source=e["source"] + " (Grok reads Claude's config)"))
-            seen.add(e["name"])
-    if not env_off("GROK_CURSOR_MCPS_ENABLED") and (compat.get("cursor") or {}).get("mcps", True):
-        for d in [home] + dirs:
-            for name, s in ((load_json(d / ".cursor/mcp.json") or {}).get("mcpServers") or {}).items():
-                if name not in seen and name not in blocked:
-                    out.append(make_entry("grok", name, "user" if d == home else "project:" + str(d),
-                                          str(d / ".cursor/mcp.json") + " (Grok reads Cursor's config)", s))
-                    seen.add(name)
+    use_claude = not env_off("GROK_CLAUDE_MCPS_ENABLED") and (compat.get("claude") or {}).get("mcps", True)
+    use_cursor = not env_off("GROK_CURSOR_MCPS_ENABLED") and (compat.get("cursor") or {}).get("mcps", True)
+    blocked = set(cfg.get("disabled_mcp_servers") or [])
+    out, emitted = [], set()
+
+    def emit(e):
+        k = (e["name"], e["scope"], e["source"])
+        if k not in emitted:
+            emitted.add(k)
+            out.append(e)
+
+    for cwd in list(cwds) or [None]:
+        dirs = [d for d in project_dirs(cwd, home) if d != home] if cwd else []
+        roots = {str(d) for d in dirs}
+        seen = set()
+        layers = [("project:" + str(d), str(d / ".grok/config.toml"), toml_servers(d / ".grok/config.toml")[1])
+                  for d in dirs] + [("user", "~/.grok/config.toml", servers)]
+        for scope, source, layer in layers:
+            for name, s in layer.items():
+                if name in seen or name in blocked:
+                    continue
+                seen.add(name)  # a disabled entry still hides the same name in lower layers
+                if s.get("enabled", True):
+                    emit(make_entry("grok", name, scope, source, s))
+        if use_claude:
+            for e in claude:
+                if e["plugin"] or e["scope"] == "managed" or e["name"] in seen or e["name"] in blocked:
+                    continue
+                if e["scope"] != "user" and e["scope"].split(":", 1)[1] not in roots:
+                    continue
+                seen.add(e["name"])
+                emit(dict(e, agent="grok", source=e["source"] + " (Grok reads Claude's config)"))
+        if use_cursor:
+            for d in dirs + [home]:
+                for name, s in ((load_json(d / ".cursor/mcp.json") or {}).get("mcpServers") or {}).items():
+                    if name not in seen and name not in blocked:
+                        seen.add(name)
+                        emit(make_entry("grok", name, "user" if d == home else "project:" + str(d),
+                                        str(d / ".cursor/mcp.json") + " (Grok reads Cursor's config)", s))
     return out
 
 
@@ -312,7 +327,8 @@ def display(key):
     if kind == "pkg":
         return key[1]
     if kind == "path":
-        script = key[2] if re.fullmatch(r"[\w./~@+-]{1,200}", key[2]) else "<arg>"
+        path_like = "/" in key[2] or re.search(r"\.(m?js|cjs|py|ts)$", key[2])
+        script = key[2] if path_like and re.fullmatch(r"[\w./~@+-]{1,200}", key[2]) else "<arg>"
         return f"{key[1]} {script}"
     return key[1]
 
@@ -336,7 +352,7 @@ def matcher(key):
     kind = key[0]
     if kind == "pkg":
         rest = "".join(r"\s+" + tok(a) for a in key[3])
-        return re.compile(r"(?:^|[\s/])" + tok(key[2]) + r"(?:\s|$)" + (r".*?" + rest if rest else ""))
+        return re.compile(r"(?:^|\s)" + tok(key[2]) + r"(?=\s|$)" + (r".*?" + rest if rest else ""))
     if kind in ("path", "cmd"):
         args = "".join(r"\s+" + tok(a) for a in key[3])
         return re.compile(r"^(?:.*/)?" + re.escape(key[1]) + args + r"\s*$")
@@ -430,20 +446,21 @@ def find_instances(procs, sessions, entries):
     instances = []
     for p in procs.values():
         parent = procs.get(p["ppid"])
-        if not parent or not agent_kind(parent["cmd"]) or base(p["cmd"]) in SHELLS:
+        if not parent or not agent_kind(parent["cmd"]):
             continue
+        shell = base(p["cmd"]) in SHELLS
         session = p["ppid"] if p["ppid"] in sessions else next(
             (a["pid"] for a in ancestors(procs, p["pid"]) if a["pid"] in sessions), None)
         if session is None:
             continue
         cmd = p["cmd"]
         key = next((k for k, rx in patterns if rx and rx.search(cmd)), None)
-        if key is None:  # same package with different args than configured: accept only if unambiguous
+        if key is None and not shell:  # same package, other args than configured: only if unambiguous
             hits = [ks for name, ks in by_pkg.items()
-                    if re.search(r"(?:^|[\s/])" + re.escape(name) + r"(?:[@=\s]|$)", cmd)]
+                    if re.search(r"(?:^|\s)" + re.escape(name) + r"(?=[@=\s]|$)", cmd)]
             key = hits[0][0] if len(hits) == 1 and len(hits[0]) == 1 else None
         if key is None:
-            if agent_kind(cmd):
+            if shell or agent_kind(cmd):
                 continue
             words = [os.path.basename(w) for w in cmd.split()[:2]]
             label = next((w for w in words if "mcp" in w.lower() and SAFE_NAME_RE.match(w)), None)
@@ -545,7 +562,7 @@ def classify(key, entries, insts, usage, days):
             used[a] = len(set().union(*[usage[a]["used"].get(n, set()) for n in logs] or [set()]))
     used_total = None if unknown or used is None else sum(v for v in used.values() if v)
     secrets = sorted({k for e in entries for k in e["env_keys"] + e["header_keys"] if SECRET_RE.search(k)})
-    configs = len(names) or 1
+    configs = len({(e["name"], e["source"]) for e in entries if "(Grok reads" not in e["source"]}) or 1
     rname, recipe, lookalike = recipe_for(key)
     plugin = any(e["plugin"] for e in entries)
     flags, saving = [], 0
@@ -583,8 +600,8 @@ def classify(key, entries, insts, usage, days):
     if action in ("share", "check") and secrets:
         flags.append("holds a credential: a shared copy must refuse callers without a key, proven by a real tool call")
     if action == "share" and secrets and configs > 1:
-        flags.append(f"configured under {configs} names with credentials: if they are different accounts, "
-                     "each needs its own shared copy")
+        flags.append(f"{configs} separate configurations hold credentials: the saving keeps one copy each; "
+                     "if they are the same account, one copy can serve all of them")
     if key[0] == "pkg" and not pinned(key[2]):
         flags.append("version not pinned to an exact release")
     launchers = sum(i["launchers"] for i in insts)
@@ -626,7 +643,8 @@ def audit(home, ps_text=None, use_cli=True, days=30, usage=True, cwds=None):
     procs = read_ps(ps_text)
     sessions = find_sessions(procs)
     if cwds is None:
-        cwds = [] if ps_text is not None else sorted(set(session_cwds(list(sessions)).values()))
+        agent_pids = [p["pid"] for p in procs.values() if agent_kind(p["cmd"])]
+        cwds = [] if ps_text is not None else sorted(set(session_cwds(agent_pids).values()))
     claude = claude_entries(home, cwds)
     entries = claude + codex_entries(home, use_cli, cwds) + grok_entries(home, claude, cwds)
     instances = find_instances(procs, sessions, entries)

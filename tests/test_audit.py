@@ -155,8 +155,8 @@ class AuditTest(unittest.TestCase):
         self.assertIn("SLACK_MCP_XOXP_TOKEN", self.rows["slack"]["credential_names"])
 
 
-class ReviewRegressionTest(unittest.TestCase):
-    """One case per defect found in review, on small made-up machines."""
+class SmallMachine(unittest.TestCase):
+    """A small made-up machine; each test writes only the config it needs."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -175,6 +175,10 @@ class ReviewRegressionTest(unittest.TestCase):
     def rows(self, report):
         return {r["server"]: r for r in report["servers"]}
 
+
+class ReviewRegressionTest(SmallMachine):
+    """One case per defect found in the first review round."""
+
     def test_argument_values_never_reach_output(self):
         ps = "\n".join(["10 1 100 claude", "11 10 50 custom-mcp --header=Authorization:SENTINEL",
                          "12 10 50 node /srv/server.js"])
@@ -190,7 +194,7 @@ class ReviewRegressionTest(unittest.TestCase):
                          "12 10 1024 npm exec slack-mcp-server@1.3.0", "14 12 10240 node slack"])
         row = self.rows(self.run_audit(cfg, ps, usage=False))["slack-a, slack-b"]
         self.assertEqual((row["rss_mb"], row["saving_mb"]), (22, 2))  # both servers stay, only launchers go
-        self.assertTrue(any("different accounts" in f for f in row["flags"]))
+        self.assertTrue(any("2 separate configurations hold credentials" in f for f in row["flags"]))
 
     def test_nested_agent_is_a_boundary(self):
         cfg = {"alpha": {"command": "npx", "args": ["-y", "alpha-mcp@1.0.0"]},
@@ -280,6 +284,54 @@ class ReviewRegressionTest(unittest.TestCase):
             self.assertFalse(audit.pinned(spec), spec)
         for spec in ("x@1.3.0", "@s/x@0.0.83", "x==0.23.1"):
             self.assertTrue(audit.pinned(spec), spec)
+
+
+class ReviewRoundTwoTest(SmallMachine):
+    """One case per defect found in the second review round."""
+
+    def test_bare_argument_values_never_print(self):
+        r = self.run_audit({"c": {"command": "custom-mcp", "args": ["--token", "SENTINEL_SECRET"]}},
+                           "10 1 100 claude\n11 10 50 custom-mcp --token SENTINEL_SECRET")
+        self.assertNotIn("SENTINEL", audit.markdown(r, self.home) + json.dumps(r))
+
+    def test_same_name_in_two_agents_keeps_a_copy_each(self):
+        write(self.home / ".codex/config.toml", '[mcp_servers.slack]\ncommand = "npx"\n'
+              'args = ["-y", "slack-mcp-server@1.3.0"]\nenv = { SLACK_MCP_XOXP_TOKEN = "y" }\n')
+        cfg = {"slack": {"command": "npx", "args": ["-y", "slack-mcp-server@1.3.0"], "env": {"SLACK_MCP_XOXP_TOKEN": "x"}}}
+        ps = "\n".join(["10 1 100 claude", "11 10 1024 npm exec slack-mcp-server@1.3.0", "13 11 10240 node s",
+                         "20 1 100 codex", "21 20 1024 npm exec slack-mcp-server@1.3.0", "23 21 10240 node s"])
+        row = self.rows(self.run_audit(cfg, ps, usage=False))["slack"]
+        self.assertEqual(row["saving_mb"], 2)
+
+    def test_scoped_package_is_not_the_unscoped_one(self):
+        cfg = {"alpha": {"command": "npx", "args": ["-y", "alpha-mcp@1.0.0"]}}
+        ps = "10 1 100 claude\n11 10 50 npm exec @evil/alpha-mcp@1.0.0"
+        self.assertEqual(self.rows(self.run_audit(cfg, ps))["alpha"]["copies"], 0)
+
+    def test_uv_directory_option_is_not_the_package(self):
+        e = audit.make_entry("claude", "a", "user", "-", {"command": "uvx", "args": ["--directory", "/srv/p", "mcp-atlassian@0.23.1"]})
+        self.assertEqual(audit.identity(e)[1], "mcp-atlassian")
+
+    def test_configured_arguments_still_match(self):
+        cfg = {n: {"command": "npx", "args": ["-y", "alpha-mcp@1.0.0", "--workspace", n]} for n in ("a", "b")}
+        ps = "10 1 100 claude\n11 10 50 npm exec alpha-mcp@1.0.0 --workspace a\n12 10 50 npm exec alpha-mcp@1.0.0 --workspace b"
+        rows = self.rows(self.run_audit(cfg, ps))
+        self.assertEqual((rows["a"]["copies"], rows["b"]["copies"]), (1, 1))
+
+    def test_one_grok_project_does_not_hide_another(self):
+        write(self.home / ".grok/config.toml", '[mcp_servers.worker]\ncommand = "python"\nargs = ["/u/worker.py"]\n')
+        a = self.home / "a"
+        write(a / ".grok/config.toml", '[mcp_servers.worker]\ncommand = "python"\nargs = ["/a/worker.py"]\n')
+        (self.home / "b").mkdir()
+        ps = "10 1 100 grok\n11 10 50 python /a/worker.py\n20 1 100 grok\n21 20 50 python /u/worker.py"
+        r = self.run_audit({}, ps, cwds=[str(a), str(self.home / "b")])
+        self.assertEqual(sum(x["copies"] for x in r["servers"]), 2)
+
+    def test_configured_shell_launch_is_counted(self):
+        cfg = {"custom": {"command": "bash", "args": ["-lc", "node /srv/custom-mcp.js; wait"]}}
+        ps = "10 1 100 claude\n11 10 50 bash -lc node /srv/custom-mcp.js; wait\n12 11 11264 node /srv/custom-mcp.js"
+        row = self.rows(self.run_audit(cfg, ps))["custom"]
+        self.assertEqual((row["copies"], row["processes"]), (1, 2))
 
 
 class HelperTest(unittest.TestCase):
