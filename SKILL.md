@@ -8,7 +8,7 @@ description: Audit MCP server sprawl on this machine for Claude Code, Codex CLI 
 Each agent session starts its own copy of every local (stdio) MCP server in its config.
 Fifty sessions means fifty copies, plus an idle npx or uvx launcher above each one. This
 skill measures that and proposes a plan. It never edits a config, starts or stops a
-process, or prints a secret value.
+process, prints a secret value or prints command-line arguments.
 
 ## 1. Run the audit
 
@@ -30,7 +30,10 @@ What it reads, all locally:
 | Grok CLI | `~/.grok/config.toml`, plus Claude's and Cursor's config, which Grok loads by default | `~/.grok/sessions/**/updates.jsonl` |
 
 Processes come from `ps`. A copy is a process an agent started that matches a configured
-server, together with everything below it.
+server, together with everything below it, stopping at any agent it starts in turn.
+Project config is read for the folders the running sessions were started in. Usage counts
+calls by their own timestamps; `?` means that agent's logs were not found, so usage is
+unknown and nothing is marked for removal on that basis.
 
 ## 2. Finish the classification
 
@@ -44,7 +47,7 @@ Each server gets one action:
 | `per-project` | Stdio only and rarely called. Configure it only in the projects that need it. |
 | `remove` / `remove?` | Not called in the usage window. `remove?` means confirm with the user first. |
 | `plugin` | Bundled with a plugin or app. Only its author can change how it starts. |
-| `check` | Unknown server. Your job, below. |
+| `check` | Unknown server, or one whose name only resembles a known one. Your job, below. |
 | `ok` | Already HTTP. Nothing to do. |
 
 For every `check` row, find out whether the server can serve Streamable HTTP. Read its
@@ -62,9 +65,12 @@ used it, estimated saving, and the reason with its source link. Then the flags:
   must refuse callers that lack a key, and that has to be proven with a real tool call
   without the key, not assumed. Some servers check the key only on tool calls, others
   ignore their stored token over HTTP. The recipe notes say which.
-- **version not pinned**: a long-running shared copy should never pull `@latest`.
+- **version not pinned to an exact release**: `@latest`, `@next`, `^1.0.0` and a bare
+  name all float. A long-running shared copy should run one exact version.
 - **idle launchers**: npx or uvx processes that only wait for their child.
-- **duplicates**: one server configured under two names, running twice per session.
+- **duplicates**: one server configured under two names, running twice per session. Two
+  names can mean two accounts: confirm the account and settings match before keeping one,
+  and give each account its own shared copy otherwise.
 
 Memory figures are resident size from `ps`, which undercounts on a machine that is
 already swapping. Say so when you quote them.

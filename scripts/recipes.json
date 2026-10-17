@@ -19,13 +19,11 @@
   },
   "awslabs.aws-pricing-mcp-server": {
     "http": false,
-    "aliases": ["aws-pricing-mcp-server"],
     "how": "Starts with mcp.run() and no transport option, so it speaks stdio only.",
     "source": "https://github.com/awslabs/mcp/tree/main/src/aws-pricing-mcp-server"
   },
   "@upstash/context7-mcp": {
     "hosted": "https://mcp.context7.com/mcp",
-    "aliases": ["context7"],
     "how": "Point every agent at the hosted URL and drop the local copy. An API key is optional, for higher rate limits.",
     "source": "https://github.com/upstash/context7"
   },

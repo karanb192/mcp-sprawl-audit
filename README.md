@@ -5,8 +5,9 @@ its config. With many sessions open, that adds up to hundreds of processes and g
 of memory, most of it waiting for a tool call that never comes.
 
 This is an agent skill and a single Python script that measures that on your machine and
-writes a plan. It is read-only: it changes no config, touches no process, and reads the
-names of env vars and headers, never their values.
+writes a plan. It is read-only: it changes no config and touches no process. It reads the
+names of env vars and headers, never their values, and never prints command-line arguments,
+which can carry keys.
 
 ## Use it
 
@@ -39,7 +40,9 @@ python3 scripts/audit.py --no-usage --days 14
 - One action per server: `share` (serve one copy over HTTP on 127.0.0.1), `use-hosted`,
   `keep`, `per-project`, `remove?`, `plugin` (bundled, only its author can change it),
   `check` (unknown: the agent looks it up) or `ok`.
-- Flags: servers holding a credential, unpinned versions, duplicates under two names.
+- Flags: servers holding a credential, versions not pinned to an exact release, and one
+  server configured under two names (which may be two accounts, so it never assumes one copy
+  can serve both).
 
 A sample from a made-up machine with two Claude sessions, one Codex and one Grok:
 
@@ -68,14 +71,19 @@ Idle npx/uvx launchers among them: 14 processes, 410 MB.
 
 `scripts/recipes.json` holds servers whose HTTP support has been checked, each with the
 flags to run it, its auth behaviour and a source link. Anything else comes out as `check`,
-and the skill tells the agent to read that server's docs rather than guess. To add one,
+including a package whose name only resembles a known one, and the skill tells the agent to
+read that server's docs rather than guess. To add one,
 open a PR with the entry and the link that proves it.
 
 ## Limits
 
 - macOS and Linux. Memory is resident size from `ps`, which undercounts on a machine that
   is already swapping.
-- Usage counts depend on each agent's log format, which can change between versions.
+- Usage counts depend on each agent's log format, which can change between versions. When
+  an agent's log folder is missing, usage shows `?` and nothing is marked for removal.
+- Project-level config is read for the folders that running sessions were started in.
+  Claude Code scope precedence and per-project plugin settings are approximated: every
+  scope's entry is listed rather than resolved.
 - It stops at the plan. Setting up shared HTTP services is a separate step, and a server
   that holds a credential must be proven to refuse callers without a key before it is shared.
 
