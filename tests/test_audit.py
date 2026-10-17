@@ -294,6 +294,11 @@ class ReviewRoundTwoTest(SmallMachine):
                            "10 1 100 claude\n11 10 50 custom-mcp --token SENTINEL_SECRET")
         self.assertNotIn("SENTINEL", audit.markdown(r, self.home) + json.dumps(r))
 
+    def test_bare_argument_values_never_print_as_duplicate_stems(self):
+        cfg = {n: {"command": "custom-mcp", "args": ["--token", "SENTINEL_SECRET"]} for n in ("a", "b")}
+        r = self.run_audit(cfg, "10 1 100 claude")
+        self.assertNotIn("SENTINEL", audit.markdown(r, self.home) + json.dumps(r))
+
     def test_same_name_in_two_agents_keeps_a_copy_each(self):
         write(self.home / ".codex/config.toml", '[mcp_servers.slack]\ncommand = "npx"\n'
               'args = ["-y", "slack-mcp-server@1.3.0"]\nenv = { SLACK_MCP_XOXP_TOKEN = "y" }\n')

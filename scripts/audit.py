@@ -320,6 +320,11 @@ def identity(e):
     return ("cmd", base(e["command"]), "", tuple(e["args"]))
 
 
+def path_like(arg):
+    """Only a file path is ever printed from a command line; any other argument may be a key."""
+    return bool(("/" in arg or re.search(r"\.(m?js|cjs|py|ts)$", arg)) and re.fullmatch(r"[\w./~@+-]{1,200}", arg))
+
+
 def display(key):
     kind = key[0]
     if kind == "url":
@@ -327,8 +332,7 @@ def display(key):
     if kind == "pkg":
         return key[1]
     if kind == "path":
-        path_like = "/" in key[2] or re.search(r"\.(m?js|cjs|py|ts)$", key[2])
-        script = key[2] if path_like and re.fullmatch(r"[\w./~@+-]{1,200}", key[2]) else "<arg>"
+        script = key[2] if path_like(key[2]) else "<arg>"
         return f"{key[1]} {script}"
     return key[1]
 
@@ -336,7 +340,7 @@ def display(key):
 def stem(key):
     if key[0] == "pkg":
         return key[1].split("/")[-1]
-    if key[0] == "path":
+    if key[0] == "path" and path_like(key[2]):
         parts = [re.sub(r"\.(m?js|cjs|py|ts)$", "", p) for p in key[2].split("/") if p]
         for p in reversed(parts):
             if p not in STEM_SKIP and not p.startswith("$") and SAFE_NAME_RE.match(p):
