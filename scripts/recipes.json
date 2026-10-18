@@ -8,6 +8,7 @@
   "slack-mcp-server": {
     "http": true,
     "how": "Run with --transport http and SLACK_MCP_HOST=127.0.0.1, SLACK_MCP_PORT=<port>. Endpoint /mcp.",
+    "key_env": "SLACK_MCP_API_KEY",
     "auth": "Set SLACK_MCP_API_KEY and have each agent send it as a Bearer header. The key guards tool calls only: tools/list answers without it, and with no key set every call is accepted.",
     "source": "https://github.com/korotovsky/slack-mcp-server"
   },

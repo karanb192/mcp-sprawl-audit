@@ -3,7 +3,8 @@
 
 Finds every configured MCP server, counts the processes each one runs per agent session,
 classifies it and prints a plan. It changes no file and no process. It reads the names of
-env vars and headers, never their values, and never prints command-line arguments.
+env vars and headers, never their values. From a command line it prints only a package name
+or a script's file name, and from a URL only the scheme and host.
 
     python3 audit.py              # Markdown report
     python3 audit.py --json       # the same data for an agent to read
@@ -37,6 +38,7 @@ ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 VAR_RE = re.compile(r"\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*")
 PINNED_RE = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?")
 SAFE_NAME_RE = re.compile(r"^[\w.@+-]+$")
+PKG_NAME_RE = re.compile(r"(?:@[\w.-]+/)?[\w.-]+")
 STEM_SKIP = {"dist", "build", "src", "bin", "lib", "out", "index", "main", "server", "cli"}
 LOW_USE = 3
 SHELLS = {"sh", "bash", "zsh", "fish", "dash"}
@@ -170,42 +172,66 @@ def plugin_servers(root):
     return {k: v for k, v in found.items() if isinstance(v, dict)}
 
 
+def claude_dir(home):
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(d).expanduser() if d else home / ".claude"
+
+
+def claude_json(home):
+    d = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(d).expanduser() / ".claude.json" if d else home / ".claude.json"
+
+
+def grok_dir(home):
+    d = os.environ.get("GROK_HOME")
+    return Path(d).expanduser() if d else home / ".grok"
+
+
 def project_dirs(cwd, home):
-    """The working directory and its parents, up to (not past) the home directory."""
+    """The working directory and its parents up to the git root, or up to home without one."""
     p = Path(cwd)
     out = []
     while True:
         out.append(p)
-        if p == home or p.parent == p:
+        if (p / ".git").exists() or p == home or p.parent == p:
             return out
         p = p.parent
 
 
+def running_dirs(cwds, home):
+    return sorted({d for cwd in cwds for d in project_dirs(cwd, home) if d != home}, key=str)
+
+
 def claude_entries(home, cwds):
-    cj = load_json(home / ".claude.json") or {}
+    cj = load_json(claude_json(home)) or {}
     managed = [m for m in (Path("/Library/Application Support/ClaudeCode/managed-mcp.json"),
                            Path("/etc/claude-code/managed-mcp.json")) if m.exists()]
     out = []
-    if managed:  # managed-mcp.json takes exclusive control of Claude Code's MCP servers
+    if managed:  # exclusive control: no user, project or plugin servers start
         for m in managed:
             for name, s in ((load_json(m) or {}).get("mcpServers") or {}).items():
                 out.append(make_entry("claude", name, "managed", str(m), s))
-    else:
-        for name, s in (cj.get("mcpServers") or {}).items():
-            out.append(make_entry("claude", name, "user", "~/.claude.json", s))
-        projects = set(cj.get("projects") or {})
-        for cwd in cwds:
-            projects.update(str(d) for d in project_dirs(cwd, home))
-        for proj in sorted(projects):
-            pv = (cj.get("projects") or {}).get(proj) or {}
-            for name, s in (pv.get("mcpServers") or {}).items():
-                out.append(make_entry("claude", name, "local:" + proj, "~/.claude.json", s))
-            mcp_json = load_json(Path(proj) / ".mcp.json")
-            if isinstance(mcp_json, dict):
-                for name, s in (mcp_json.get("mcpServers") or {}).items():
-                    out.append(make_entry("claude", name, "project:" + proj, proj + "/.mcp.json", s))
-    installed = (load_json(home / ".claude/plugins/installed_plugins.json") or {}).get("plugins") or {}
-    enabled = (load_json(home / ".claude/settings.json") or {}).get("enabledPlugins") or {}
+        return out
+    for name, s in (cj.get("mcpServers") or {}).items():
+        out.append(make_entry("claude", name, "user", "~/.claude.json", s))
+    dirs = running_dirs(cwds, home)
+    projects = set(cj.get("projects") or {}) | {str(d) for d in dirs}
+    for proj in sorted(projects):
+        pv = (cj.get("projects") or {}).get(proj) or {}
+        for name, s in (pv.get("mcpServers") or {}).items():
+            out.append(make_entry("claude", name, "local:" + proj, "~/.claude.json", s))
+        mcp_json = load_json(Path(proj) / ".mcp.json")
+        if isinstance(mcp_json, dict):
+            for name, s in (mcp_json.get("mcpServers") or {}).items():
+                out.append(make_entry("claude", name, "project:" + proj, proj + "/.mcp.json", s))
+    cdir = claude_dir(home)
+    installed = (load_json(cdir / "plugins/installed_plugins.json") or {}).get("plugins") or {}
+    enabled = dict((load_json(cdir / "settings.json") or {}).get("enabledPlugins") or {})
+    for d in dirs:  # a project or local settings file can switch a plugin on for that repo
+        for f in (d / ".claude/settings.json", d / ".claude/settings.local.json"):
+            for plugin_id, on in ((load_json(f) or {}).get("enabledPlugins") or {}).items():
+                if on:
+                    enabled[plugin_id] = True
     for plugin_id, installs in installed.items():
         if enabled.get(plugin_id) is False or not installs:
             continue
@@ -244,13 +270,15 @@ def codex_entries(home, use_cli, cwds):
         _, servers = toml_servers(codex_home / "config.toml")
         out = [make_entry("codex", n, "user", "~/.codex/config.toml", s)
                for n, s in servers.items() if s.get("enabled", True)]
-    seen = {(e["name"], e["source"]) for e in out}
-    for d in {d for cwd in cwds for d in project_dirs(cwd, home)} - {home}:
+    # The CLI listing already includes the project it was run in, so skip what it returned.
+    seen = {(e["name"], identity(e)) for e in out}
+    for d in running_dirs(cwds, home):
         path = d / ".codex/config.toml"
         for name, s in toml_servers(path)[1].items():
-            if s.get("enabled", True) and (name, str(path)) not in seen:
-                out.append(make_entry("codex", name, "project:" + str(d), str(path), s))
-                seen.add((name, str(path)))
+            e = make_entry("codex", name, "project:" + str(d), str(path), s)
+            if s.get("enabled", True) and (name, identity(e)) not in seen:
+                out.append(e)
+                seen.add((name, identity(e)))
     return out
 
 
@@ -259,9 +287,10 @@ def env_off(name):
 
 
 def grok_entries(home, claude, cwds):
-    """Grok's effective servers for each running directory: project config, then user config,
-    then the Claude and Cursor config it imports. Contexts never hide each other's servers."""
-    cfg, servers = toml_servers(home / ".grok/config.toml")
+    """Grok's effective servers for each running directory, in Grok's documented order: its own
+    config (project, then user), then Claude's, then Cursor's, then the project .mcp.json.
+    Directories are resolved separately, so one project never hides another's servers."""
+    cfg, servers = toml_servers(grok_dir(home) / "config.toml")
     compat = cfg.get("compat") or {}
     use_claude = not env_off("GROK_CLAUDE_MCPS_ENABLED") and (compat.get("claude") or {}).get("mcps", True)
     use_cursor = not env_off("GROK_CURSOR_MCPS_ENABLED") and (compat.get("cursor") or {}).get("mcps", True)
@@ -273,6 +302,9 @@ def grok_entries(home, claude, cwds):
         if k not in emitted:
             emitted.add(k)
             out.append(e)
+
+    def borrowed(e, why):
+        return dict(e, agent="grok", source=e["source"] + why)
 
     for cwd in list(cwds) or [None]:
         dirs = [d for d in project_dirs(cwd, home) if d != home] if cwd else []
@@ -287,14 +319,13 @@ def grok_entries(home, claude, cwds):
                 seen.add(name)  # a disabled entry still hides the same name in lower layers
                 if s.get("enabled", True):
                     emit(make_entry("grok", name, scope, source, s))
+        claude_ok = [e for e in claude if not e["plugin"] and e["scope"] != "managed" and e["name"] not in blocked]
         if use_claude:
-            for e in claude:
-                if e["plugin"] or e["scope"] == "managed" or e["name"] in seen or e["name"] in blocked:
-                    continue
-                if e["scope"] != "user" and e["scope"].split(":", 1)[1] not in roots:
-                    continue
-                seen.add(e["name"])
-                emit(dict(e, agent="grok", source=e["source"] + " (Grok reads Claude's config)"))
+            for e in claude_ok:
+                if e["name"] not in seen and (e["scope"] == "user" or
+                                              (e["scope"].startswith("local:") and e["scope"][6:] in roots)):
+                    seen.add(e["name"])
+                    emit(borrowed(e, " (Grok reads Claude's config)"))
         if use_cursor:
             for d in dirs + [home]:
                 for name, s in ((load_json(d / ".cursor/mcp.json") or {}).get("mcpServers") or {}).items():
@@ -302,6 +333,10 @@ def grok_entries(home, claude, cwds):
                         seen.add(name)
                         emit(make_entry("grok", name, "user" if d == home else "project:" + str(d),
                                         str(d / ".cursor/mcp.json") + " (Grok reads Cursor's config)", s))
+        for e in claude_ok:
+            if e["scope"].startswith("project:") and e["scope"][8:] in roots and e["name"] not in seen:
+                seen.add(e["name"])
+                emit(borrowed(e, " (Grok reads .mcp.json)"))
     return out
 
 
@@ -326,14 +361,17 @@ def path_like(arg):
 
 
 def display(key):
+    """The printable form of an identity: a package name, a program and its script's file name,
+    or a URL's scheme and host. Directories, URL paths and every other argument stay hidden."""
     kind = key[0]
     if kind == "url":
-        return key[1]
+        m = re.match(r"^(\w+://[^/]*)(/.+)?", key[1])
+        return (m.group(1) + ("/..." if m.group(2) else "")) if m else "<url>"
     if kind == "pkg":
-        return key[1]
+        return key[1] if PKG_NAME_RE.fullmatch(key[1]) else "<package>"
     if kind == "path":
-        script = key[2] if path_like(key[2]) else "<arg>"
-        return f"{key[1]} {script}"
+        name = os.path.basename(key[2])
+        return f"{key[1]} {name}" if path_like(key[2]) and SAFE_NAME_RE.match(name) else f"{key[1]} <arg>"
     return key[1]
 
 
@@ -379,7 +417,8 @@ def agent_kind(cmd):
     b = base(cmd)
     if b in AGENTS:
         return b
-    if re.search(r"@anthropic-ai/claude-code/cli\.js", cmd):
+    toks = cmd.split()
+    if b in ("node", "bun") and len(toks) > 1 and toks[1].endswith("@anthropic-ai/claude-code/cli.js"):
         return "claude"
     return None
 
@@ -441,7 +480,7 @@ def find_instances(procs, sessions, entries):
     for p in procs.values():
         children[p["ppid"]].append(p["pid"])
     keys = {identity(e) for e in entries if e["transport"] == "stdio" and e["command"]}
-    patterns = [(k, matcher(k)) for k in keys]
+    patterns = [(k, matcher(k)) for k in sorted(keys, key=lambda k: (-len(k[3]) if len(k) > 3 else 0, repr(k)))]
     by_pkg = defaultdict(list)
     for k in keys:
         if k[0] == "pkg":
@@ -466,9 +505,13 @@ def find_instances(procs, sessions, entries):
         if key is None:
             if shell or agent_kind(cmd):
                 continue
-            words = [os.path.basename(w) for w in cmd.split()[:2]]
-            label = next((w for w in words if "mcp" in w.lower() and SAFE_NAME_RE.match(w)), None)
-            if not label:
+            words = cmd.split()
+            exe = os.path.basename(words[0]) if words else ""
+            if "mcp" in exe.lower() and SAFE_NAME_RE.match(exe):
+                label = exe
+            elif len(words) > 1 and "mcp" in words[1].lower():
+                label = f"{exe} <script>"  # the script path is an argument, so it is not printed
+            else:
                 continue
             key = ("unconfigured", label)
         subtree, stack = [], [p["pid"]]
@@ -485,10 +528,13 @@ def find_instances(procs, sessions, entries):
     return instances
 
 
-def event_time(data, pos, fallback):
-    start = data.rfind(b"\n", 0, pos) + 1
+def line_bounds(data, pos):
     end = data.find(b"\n", pos)
-    m = TS_RE.search(data, start, end if end != -1 else len(data))
+    return data.rfind(b"\n", 0, pos) + 1, (end if end != -1 else len(data))
+
+
+def event_time(data, pos, fallback):
+    m = TS_RE.search(data, *line_bounds(data, pos))
     if not m:
         return fallback
     if m.group(2):
@@ -504,11 +550,12 @@ def scan_usage(home, days):
     """Which servers each agent called in the last `days` days, as sets of session ids.
     An agent whose log folder is missing has unknown usage, never zero."""
     codex_home = Path(os.environ.get("CODEX_HOME") or home / ".codex")
-    mcp_name = rb'"name"\s*:\s*"mcp__(.+?)__'
-    sources = {
-        "claude": (home / ".claude/projects", "*.jsonl", [mcp_name]),
-        "codex": (codex_home / "sessions", "*.jsonl", [rb'"server"\s*:\s*"([^"]+)"', mcp_name]),
-        "grok": (home / ".grok/sessions", "updates.jsonl", [rb'"server_name"\s*:\s*"([^"]+)"']),
+    mcp_name = (rb'"name"\s*:\s*"mcp__(.+?)__', None)
+    sources = {  # (pattern, a word its line must also contain)
+        "claude": (claude_dir(home) / "projects", "*.jsonl", [mcp_name]),
+        "codex": (codex_home / "sessions", "*.jsonl", [(rb'"server"\s*:\s*"([^"]+)"', b"mcp"), mcp_name]),
+        "grok": (grok_dir(home) / "sessions", "updates.jsonl",
+                 [(rb'"server_name"\s*:\s*"([^"]+)"', None), (rb'"tool_name"\s*:\s*"([^"]+?)__', b"use_tool")]),
     }
     cutoff = time.time() - days * 86400
     usage = {}
@@ -528,8 +575,10 @@ def scan_usage(home, days):
             rel = f.relative_to(root).parts
             session = (rel[1] if agent == "claude" and len(rel) > 1 else str(f)).removesuffix(".jsonl")
             total.add(session)
-            for rx in rxs:
+            for rx, need in rxs:
                 for m in re.finditer(rx, data):
+                    if need and need not in data[slice(*line_bounds(data, m.start()))].lower():
+                        continue
                     if event_time(data, m.start(), mtime) >= cutoff:
                         used[m.group(1).decode(errors="replace")].add(session)
         usage[agent] = {"sessions": len(total), "used": used}
@@ -554,7 +603,7 @@ def classify(key, entries, insts, usage, days):
     agents = sorted({e["agent"] for e in entries} | {i["agent"] for i in insts})
     rss = sum(i["rss_kb"] for i in insts)
     launch_rss = sum(i["launcher_rss_kb"] for i in insts)
-    one_copy = (rss - launch_rss) / len(insts) if insts else 0
+    one_copy = ((rss - launch_rss) or rss) / len(insts) if insts else 0  # a launcher that exec'd is the server
     used, unknown = None, usage is None
     if usage is not None:
         used = {}
@@ -566,7 +615,8 @@ def classify(key, entries, insts, usage, days):
             used[a] = len(set().union(*[usage[a]["used"].get(n, set()) for n in logs] or [set()]))
     used_total = None if unknown or used is None else sum(v for v in used.values() if v)
     secrets = sorted({k for e in entries for k in e["env_keys"] + e["header_keys"] if SECRET_RE.search(k)})
-    configs = len({(e["name"], e["source"]) for e in entries if "(Grok reads" not in e["source"]}) or 1
+    # one configuration per agent and name: the same name in two scopes is one server to that agent
+    configs = len({(e["agent"], e["name"]) for e in entries if "(Grok reads" not in e["source"]}) or 1
     rname, recipe, lookalike = recipe_for(key)
     plugin = any(e["plugin"] for e in entries)
     flags, saving = [], 0
@@ -593,7 +643,7 @@ def classify(key, entries, insts, usage, days):
     elif recipe and recipe.get("http") is False:
         if used_total is not None and used_total <= LOW_USE:
             action, why = "per-project", f"stdio only and called in {used_total} sessions in {days} days"
-            saving = rss
+            saving = max(rss - one_copy, 0)  # the projects that call it keep their copy
         else:
             action, why = "keep", "stdio only" + ("" if used_total is None else " and used often")
     else:
@@ -601,6 +651,9 @@ def classify(key, entries, insts, usage, days):
         if lookalike:
             why += f"; its name resembles {rname}, which is not proof it is the same server"
 
+    key_env = (recipe or {}).get("key_env")
+    if action == "share" and key_env and not any(key_env in e["env_keys"] for e in entries):
+        flags.append(f"{key_env} is not set: a shared copy would accept every local caller. Set it before sharing")
     if action in ("share", "check") and secrets:
         flags.append("holds a credential: a shared copy must refuse callers without a key, proven by a real tool call")
     if action == "share" and secrets and configs > 1:
@@ -640,7 +693,8 @@ def duplicates(entries):
         for s, names in stems.items():
             if len(names) > 1:
                 found[(s, tuple(sorted(names)))].append(agent)
-    return [{"agents": agents, "stem": s, "names": list(names)} for (s, names), agents in found.items()]
+    # The shared name part is matched on but never printed: it can come from a directory name.
+    return [{"agents": agents, "names": list(names)} for (_, names), agents in found.items()]
 
 
 def audit(home, ps_text=None, use_cli=True, days=30, usage=True, cwds=None):
@@ -674,6 +728,7 @@ def audit(home, ps_text=None, use_cli=True, days=30, usage=True, cwds=None):
     return {
         "sessions": dict(counts),
         "project_dirs_seen": len(cwds),
+        "project_dirs_unknown": bool(sessions) and not cwds,
         "totals": {
             "copies": len(instances), "processes": sum(i["procs"] for i in instances),
             "rss_mb": round(sum(i["rss_kb"] for i in instances) / 1024),
@@ -734,12 +789,14 @@ def markdown(report, home):
     if report["duplicates"]:
         out += ["", "## Possible duplicates", ""]
         for d in report["duplicates"]:
-            out.append(f"- {', '.join(d['names'])} look like the same server ({d['stem']}), "
-                       f"configured for {', '.join(d['agents'])}")
+            out.append(f"- {', '.join(d['names'])} look like the same server, configured for {', '.join(d['agents'])}")
     if report["usage_sessions"]:
         window = ", ".join(f"{'no logs' if n is None else n} {a}" for a, n in report["usage_sessions"].items())
         out += ["", f"Usage counts come from session logs of the last {report['usage_window_days']} days "
                     f"({window} sessions). `?` means that agent's logs were not found, so usage is unknown."]
+    if report["project_dirs_unknown"]:
+        out += ["", "The folders the sessions run in could not be read, so servers configured only in a "
+                    "project's config may be missing."]
     text = "\n".join(out) + "\n"
     return text.replace(str(home), "~")
 
@@ -754,8 +811,9 @@ def main(argv=None):
     ap.add_argument("--ps-file", type=Path, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     if tomllib is None:
-        print("warning: Python 3.11+ is needed to read Codex and Grok config.toml; "
-              "servers configured only there are missing from this report", file=sys.stderr)
+        print("warning: Python 3.11+ is needed to read Codex and Grok config.toml. Servers configured only "
+              "there are missing, and Grok's [compat] switches cannot be read, so Claude and Cursor servers "
+              "are assumed imported", file=sys.stderr)
     ps_text = a.ps_file.read_text() if a.ps_file else None
     report = audit(a.home, ps_text, use_cli=not a.no_cli, days=a.days, usage=not a.no_usage)
     if a.json:
