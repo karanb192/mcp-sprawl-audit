@@ -8,7 +8,8 @@ description: Audit MCP server sprawl on this machine for Claude Code, Codex CLI 
 Each agent session starts its own copy of every local (stdio) MCP server in its config.
 Fifty sessions means fifty copies, plus an idle npx or uvx launcher above each one. This
 skill measures that and proposes a plan. It never edits a config, starts or stops a
-process, prints a secret value or prints command-line arguments.
+process, or prints a secret value. From a command line it prints only a package name or a
+script's file name.
 
 ## 1. Run the audit
 
@@ -27,7 +28,7 @@ What it reads, all locally:
 |---|---|---|
 | Claude Code | `~/.claude.json` (user and local scope), each project's `.mcp.json`, enabled plugins, managed-mcp.json | `~/.claude/projects/**/*.jsonl` |
 | Codex CLI | `codex mcp list --json` (includes plugin servers), else `~/.codex/config.toml` | `~/.codex/sessions/**/*.jsonl` |
-| Grok CLI | `~/.grok/config.toml`, plus Claude's and Cursor's config, which Grok loads by default | `~/.grok/sessions/**/updates.jsonl` |
+| Grok CLI | `~/.grok/config.toml` and project ones, then Claude's, Cursor's and the project `.mcp.json`, which Grok loads by default | `~/.grok/sessions/**/updates.jsonl` |
 
 Processes come from `ps`. A copy is a process an agent started that matches a configured
 server, together with everything below it, stopping at any agent it starts in turn.

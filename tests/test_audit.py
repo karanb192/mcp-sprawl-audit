@@ -45,7 +45,7 @@ class Machine:
         write(h / ".claude/projects/-work/s1.jsonl", '{"name":"mcp__slack__channels_list"}\n{"name":"mcp__mystery__go"}\n'
               '{"name":"mcp__context7__docs"}\n{"name":"mcp__reddit__search"}\n')
         write(h / ".claude/projects/-work/s2.jsonl", '{"name":"mcp__plugin_finder_mods__search"}\n')
-        write(h / ".codex/sessions/2026/10/15/r1.jsonl", '{"server":"slack"}\n')
+        write(h / ".codex/sessions/2026/10/15/r1.jsonl", '{"type":"mcp_tool_call","server":"slack"}\n')
         write(h / ".grok/sessions/x/one/updates.jsonl", '{"server_name":"atlassian"}\n')
 
         rows = [(1, 0, 10, "/sbin/launchd")]
@@ -130,8 +130,7 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(self.r["totals"]["saving_mb"], total)
 
     def test_same_server_under_two_names_is_a_duplicate(self):
-        self.assertEqual(self.r["duplicates"], [
-            {"agents": ["claude", "grok"], "stem": "reddit-mcp-buddy", "names": ["reddit", "reddit-dev"]}])
+        self.assertEqual(self.r["duplicates"], [{"agents": ["claude", "grok"], "names": ["reddit", "reddit-dev"]}])
         self.assertTrue(any("possible duplicate of reddit-dev" in f for f in self.rows["reddit"]["flags"]))
         self.assertEqual(self.rows["reddit-dev"]["action"], "remove?")
 
@@ -337,6 +336,86 @@ class ReviewRoundTwoTest(SmallMachine):
         ps = "10 1 100 claude\n11 10 50 bash -lc node /srv/custom-mcp.js; wait\n12 11 11264 node /srv/custom-mcp.js"
         row = self.rows(self.run_audit(cfg, ps))["custom"]
         self.assertEqual((row["copies"], row["processes"]), (1, 2))
+
+
+class GrokReviewTest(SmallMachine):
+    """One case per defect found in the Grok review."""
+
+    def output(self, r):
+        return audit.markdown(r, self.home) + json.dumps(r)
+
+    def test_package_urls_paths_and_url_paths_never_print_secrets(self):
+        cfg = {"a": {"command": "npx", "args": ["-y", "https://oauth2:ghp_LEAK1@github.com/o/p/archive/main.tar.gz"]},
+               "b": {"command": "node", "args": ["/var/lib/mcp/sk-live-LEAK2/server.js"]},
+               "c": {"type": "http", "url": "https://host.example/mcp/sk-live-LEAK3"},
+               "d": {"command": "node", "args": ["/srv/LEAK4-dir/x-mcp/index.js"]},
+               "e": {"command": "node", "args": ["/srv/LEAK4-dir/x-mcp/index.js", "--dev"]}}
+        ps = "10 1 100 claude\n11 10 50 node sk-mcp-LEAK5\n12 10 50 node /var/lib/mcp/sk-live-LEAK2/server.js"
+        out = self.output(self.run_audit(cfg, ps))
+        for leak in ("LEAK1", "LEAK2", "LEAK3", "LEAK4", "LEAK5"):
+            self.assertNotIn(leak, out)
+
+    def test_the_most_specific_configuration_wins_the_process(self):
+        cfg = {"short": {"command": "npx", "args": ["-y", "slack-mcp-server@1.3.0"]},
+               "debug": {"command": "npx", "args": ["-y", "slack-mcp-server@1.3.0", "--debug"]}}
+        ps = "10 1 100 claude\n11 10 50 npm exec slack-mcp-server@1.3.0\n12 10 50 npm exec slack-mcp-server@1.3.0 --debug"
+        rows = self.rows(self.run_audit(cfg, ps, usage=False))
+        self.assertEqual((rows["short"]["copies"], rows["debug"]["copies"]), (1, 1))
+
+    def test_grok_project_config_stops_at_the_git_root(self):
+        write(self.home / ".grok/config.toml", '[mcp_servers.worker]\ncommand = "python"\nargs = ["/u/worker.py"]\n')
+        write(self.home / "work/.grok/config.toml", '[mcp_servers.worker]\ncommand = "python"\nargs = ["/w/worker.py"]\n')
+        repo = self.home / "work/repo"
+        (repo / ".git").mkdir(parents=True)
+        r = self.run_audit({}, "10 1 100 grok\n11 10 50 python /u/worker.py", cwds=[str(repo)])
+        self.assertEqual(self.rows(r)["worker"]["copies"], 1)
+
+    def test_grok_puts_cursor_before_the_project_mcp_json(self):
+        repo = self.home / "repo"
+        (repo / ".git").mkdir(parents=True)
+        write(repo / ".mcp.json", json.dumps({"mcpServers": {"gh": {"type": "http", "url": "https://mcp.example.com/mcp"}}}))
+        write(repo / ".cursor/mcp.json", json.dumps({"mcpServers": {"gh": {"command": "npx", "args": ["-y", "gh-mcp@1.2.3"]}}}))
+        r = self.run_audit({}, "10 1 100 grok\n11 10 50 npm exec gh-mcp@1.2.3", cwds=[str(repo)])
+        grok_rows = [x for x in r["servers"] if x["server"] == "gh" and x["copies"]]
+        self.assertEqual(len(grok_rows), 1)
+
+    def test_relocated_claude_and_grok_homes_are_read(self):
+        alt = self.home / "alt-claude"
+        write(alt / ".claude.json", json.dumps({"mcpServers": {"alpha": {"command": "npx", "args": ["-y", "alpha-mcp@1.0.0"]}}}))
+        write(alt / "projects/-p/s1.jsonl", '{"name":"mcp__alpha__x"}\n')
+        os.environ["CLAUDE_CONFIG_DIR"] = str(alt)
+        os.environ["GROK_HOME"] = str(self.home / "alt-grok")
+        try:
+            r = audit.audit(self.home, "10 1 100 claude\n11 10 50 npm exec alpha-mcp@1.0.0", use_cli=False, cwds=[])
+        finally:
+            del os.environ["CLAUDE_CONFIG_DIR"], os.environ["GROK_HOME"]
+        row = self.rows(r)["alpha"]
+        self.assertEqual((row["copies"], row["used_sessions"]["claude"], row["used_sessions"]["grok"]), (1, 1, None))
+
+    def test_per_project_keeps_a_copy_in_the_saving(self):
+        write(self.home / ".claude/projects/-p/s1.jsonl", '{"name":"mcp__aws__x"}\n')
+        cfg = {"aws": {"command": "uvx", "args": ["awslabs.aws-pricing-mcp-server@1.0.0"]}}
+        ps = "10 1 100 claude\n" + "\n".join(f"{11 + i} 10 10240 uv tool uvx awslabs.aws-pricing-mcp-server@1.0.0"
+                                                for i in range(4))
+        row = self.rows(self.run_audit(cfg, ps))["aws"]
+        self.assertEqual((row["action"], row["rss_mb"], row["saving_mb"]), ("per-project", 40, 30))
+
+    def test_one_command_in_two_claude_scopes_is_one_configuration(self):
+        proj = self.home / "proj"
+        (proj / ".git").mkdir(parents=True)
+        slack = {"command": "npx", "args": ["-y", "slack-mcp-server@1.3.0"], "env": {"SLACK_MCP_XOXP_TOKEN": "x"}}
+        write(proj / ".mcp.json", json.dumps({"mcpServers": {"slack": slack}}))
+        row = self.rows(self.run_audit({"slack": slack}, "10 1 100 claude", cwds=[str(proj)]))["slack"]
+        self.assertFalse(any("separate configurations" in f for f in row["flags"]))
+
+    def test_a_search_for_the_claude_script_is_not_a_session(self):
+        r = self.run_audit({}, "10 1 100 rg @anthropic-ai/claude-code/cli.js\n20 1 100 node /x/@anthropic-ai/claude-code/cli.js")
+        self.assertEqual(r["sessions"], {"claude": 1})
+
+    def test_slack_without_its_key_is_flagged(self):
+        cfg = {"slack": {"command": "npx", "args": ["-y", "slack-mcp-server@1.3.0"], "env": {"SLACK_MCP_XOXP_TOKEN": "x"}}}
+        row = self.rows(self.run_audit(cfg, "10 1 100 claude\n11 10 50 npm exec slack-mcp-server@1.3.0", usage=False))["slack"]
+        self.assertTrue(any(f.startswith("SLACK_MCP_API_KEY is not set") for f in row["flags"]))
 
 
 class HelperTest(unittest.TestCase):

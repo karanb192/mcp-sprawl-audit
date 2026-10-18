@@ -6,8 +6,9 @@ of memory, most of it waiting for a tool call that never comes.
 
 This is an agent skill and a single Python script that measures that on your machine and
 writes a plan. It is read-only: it changes no config and touches no process. It reads the
-names of env vars and headers, never their values, and never prints command-line arguments,
-which can carry keys.
+names of env vars and headers, never their values. From a command line it prints only a
+package name or a script's file name, and from a URL only the scheme and host, because the
+rest can carry keys.
 
 ## Use it
 
@@ -64,8 +65,11 @@ Idle npx/uvx launchers among them: 14 processes, 410 MB.
 | Agent | Config | Usage |
 |---|---|---|
 | Claude Code | `~/.claude.json`, project `.mcp.json`, enabled plugins, managed-mcp.json | `~/.claude/projects` |
-| Codex CLI | `codex mcp list --json`, else `~/.codex/config.toml` | `~/.codex/sessions` |
-| Grok CLI | `~/.grok/config.toml`, plus the Claude and Cursor config it loads by default | `~/.grok/sessions` |
+| Codex CLI | `codex mcp list --json`, else `~/.codex/config.toml`, plus each running project's `.codex/config.toml` | `~/.codex/sessions` |
+| Grok CLI | `~/.grok/config.toml` and project ones, then Claude's, Cursor's and the project `.mcp.json`, in Grok's order | `~/.grok/sessions` |
+
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `GROK_HOME` are honoured when set. Project config is read
+from each running session's folder up to its git root.
 
 ## Known servers
 
@@ -82,8 +86,9 @@ open a PR with the entry and the link that proves it.
 - Usage counts depend on each agent's log format, which can change between versions. When
   an agent's log folder is missing, usage shows `?` and nothing is marked for removal.
 - Project-level config is read for the folders that running sessions were started in.
-  Claude Code scope precedence and per-project plugin settings are approximated: every
-  scope's entry is listed rather than resolved.
+  Claude Code scope precedence is approximated: every scope's entry is listed rather than
+  resolved. Grok's marker for a dismissed Claude import is not read, so a project
+  `.mcp.json` is always assumed loaded.
 - It stops at the plan. Setting up shared HTTP services is a separate step, and a server
   that holds a credential must be proven to refuse callers without a key before it is shared.
 
