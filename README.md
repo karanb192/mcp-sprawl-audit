@@ -10,6 +10,10 @@ names of env vars and headers, never their values. From a command line it prints
 package name or a script's file name, and from a URL only the scheme and host, because the
 rest can carry keys.
 
+[Why this exists](https://karanbansal.in/blog/mcp-sprawl/) tells the story of 57 agent
+sessions running 646 MCP server processes on one laptop, and how sharing three servers over
+localhost took them from 19.5 GB to 301 MB.
+
 ## Use it
 
 Hand it to your agent:
